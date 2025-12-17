@@ -195,8 +195,18 @@ const App: React.FC = () => {
           if (!ragApiUrl) {
               throw new Error("Python Backend URL is missing. Please check settings.");
           }
-          // Use the new non-streaming function
-          response = await generateWorkflowLocal(prompt, ragApiUrl);
+          // Now using restored streaming logic for local LLM
+          response = await generateWorkflowLocal(
+              prompt, 
+              localLlmApiUrl, 
+              localLlmModel, 
+              inventory, 
+              uploadedImageName, 
+              ragApiUrl, 
+              'api', 
+              systemPrompt, 
+              (thoughts) => setLiveThoughts(thoughts)
+          );
       } else {
           response = await generateWorkflow(prompt, ragApiUrl, inventory, uploadedImageName, localLlmModel, 'api', systemPrompt);
       }
@@ -256,6 +266,7 @@ const App: React.FC = () => {
       showToast(error.message || t.toastUnknownError, 'error');
     } finally {
       setLoadingState({ active: false, message: '', progress: 0 });
+      setLiveThoughts(''); // Clear thoughts after generation
     }
   };
   
