@@ -10,20 +10,21 @@ import {
 } from './prompts';
 
 /**
- * Robust JSON Extractor (The "Surgical Parser")
+ * Surgical JSON Extractor
  * Identifies the actual workflow JSON within a mix of reasoning text and markdown.
+ * Handles cases where additional text follows the JSON object.
  */
 function extractJson(text: string): string {
-  // Strategy 1: Explicit Marker
+  // Strategy 1: Look for the explicit marker
   const marker = "###JSON_START###";
   if (text.includes(marker)) {
     const parts = text.split(marker);
     return parts[1].trim(); 
   }
 
-  // Strategy 2: ComfyUI JSON Start Pattern Matching
-  // Searching for typical keys to avoid false positives from thinking-text braces.
-  const patterns = ['{"workflow"', '{"nodes"', '{"requirements"', '{"last_node_id"'];
+  // Strategy 2: Intelligent pattern matching for ComfyUI keys
+  // This prevents accidentally starting at a random brace in the thought process.
+  const patterns = ['{"workflow"', '{"nodes"', '{"requirements"', '{"last_node_id"', '{"lines"'];
   
   let bestStartIndex = -1;
   for (const pattern of patterns) {
@@ -36,7 +37,7 @@ function extractJson(text: string): string {
   }
 
   if (bestStartIndex > -1) {
-    // Balanced brace counting to find the actual end of the primary object
+    // Balanced brace counting to find the ECHTE end of the object
     let openBraces = 0;
     let endIndex = -1;
     let insideString = false;
@@ -54,7 +55,7 @@ function extractJson(text: string): string {
           openBraces--;
           if (openBraces === 0) {
             endIndex = i;
-            break;
+            break; 
           }
         }
       }
@@ -65,19 +66,19 @@ function extractJson(text: string): string {
     }
   }
 
-  // Strategy 3: Fallback (Legacy)
+  // Strategy 3 (Emergency Fallback): Find the first and last braces
   const firstBrace = text.indexOf('{');
   const lastBrace = text.lastIndexOf('}');
   if (firstBrace > -1 && lastBrace > firstBrace) {
       return text.substring(firstBrace, lastBrace + 1);
   }
 
-  throw new Error("No valid JSON object found in model response.");
+  throw new Error("No valid JSON object found in LLM response.");
 }
 
 /**
- * STREAMING GENERATION - SMART NDJSON HANDLER
- * Processes real-time tokens (thoughts) and status messages from the Python backend.
+ * STREAMING GENERATION - SMART NDJSON EDITION
+ * Robust stream reading, line-splitting, and surgical extraction.
  */
 export const generateWorkflowLocal = async (
     description: string,
@@ -89,10 +90,8 @@ export const generateWorkflowLocal = async (
     format: WorkflowFormat = 'graph',
     systemInstructionTemplate: string = SYSTEM_INSTRUCTION_TEMPLATE,
     onThoughtsUpdate: (thoughtChunk: string) => void,
-    onStatusUpdate?: (status: string) => void // Optional status callback
+    onStatusUpdate?: (status: string) => void
 ): Promise<GeneratedWorkflowResponse> => {
-    
-    console.log("🚀 Starting Smart NDJSON Stream Request...");
     
     // --- 1. PROMPT PREPARATION ---
     let ragContextBlock = '';
@@ -102,7 +101,7 @@ export const generateWorkflowLocal = async (
             if (ragContext && ragContext.trim()) {
                 ragContextBlock = `\n**RAG-CONTEXT:**\n${ragContext.trim()}\n`;
             }
-        } catch (e) { console.warn("RAG retrieval failed", e); }
+        } catch (e) { console.warn("RAG failed", e); }
     }
 
     const formatInstruction = format === 'api' ? API_FORMAT_INSTRUCTION : GRAPH_FORMAT_INSTRUCTION;
@@ -112,11 +111,14 @@ export const generateWorkflowLocal = async (
         .replace('{{SYSTEM_INVENTORY_PLACEHOLDER}}', inventory ? `\nInventory: ${JSON.stringify(inventory)}\n` : '')
         .replace('{{FORMAT_INSTRUCTION_PLACEHOLDER}}', formatInstruction);
 
-    // --- 2. STREAM REQUEST ---
-    const API_URL = 'http://192.168.1.73:8000/v1/generate_workflow_stream';
+    // --- 2. NDJSON STREAM REQUEST ---
+    console.log("🚀 Calling Local NDJSON Streaming Backend...");
+    
+    // Using the specified /v1/generate_workflow_stream endpoint
+    const endpoint = new URL('/v1/generate_workflow_stream', ragApiUrl).toString();
 
     try {
-        const response = await fetch(API_URL, {
+        const response = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -135,14 +137,14 @@ export const generateWorkflowLocal = async (
         let fullText = '';
         let buffer = ''; 
 
-        // --- PHASE 1: STREAM PROCESSING (NDJSON) ---
+        // --- PHASE 1: STREAM PROCESSING (Line-Splitter) ---
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
 
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop() || ''; // Keep incomplete line in buffer
+            buffer = lines.pop() || ''; // Keep incomplete lines in buffer
 
             for (const line of lines) {
                 if (!line.trim()) continue;
@@ -153,51 +155,53 @@ export const generateWorkflowLocal = async (
                         console.log("Backend Status:", msg.data);
                     } else if (msg.type === 'token') {
                         fullText += msg.data;
-                        onThoughtsUpdate(fullText); // Stream combined thoughts to UI
+                        // Stream the accumulated tokens (reasoning) back to UI
+                        onThoughtsUpdate(fullText);
                     }
                 } catch (e) {
-                    // If parsing fails, it might be raw text or partial stream; try appending
+                    // Fallback for non-JSON lines (unlikely but safe)
                     fullText += line;
                     onThoughtsUpdate(fullText);
                 }
             }
         }
 
-        console.log("🏁 Stream finished. Extracting JSON payload...");
+        console.log("🏁 Stream ended. Analyzing and extracting JSON...");
 
-        // --- PHASE 2: EXTRACTION & REPAIR ---
+        // --- PHASE 2: SURGICAL EXTRACTION ---
         let thoughts = fullText;
         let jsonString = "";
 
         try {
             jsonString = extractJson(fullText);
             
-            // Isolate thoughts (everything before the JSON starts)
+            // Separate thoughts from JSON for the final return
             const jsonStartIdx = fullText.indexOf(jsonString);
             if (jsonStartIdx > -1) {
                 thoughts = fullText.substring(0, jsonStartIdx).trim();
+                // Strip the internal marker if it's there
                 thoughts = thoughts.replace("###JSON_START###", "").trim();
             }
         } catch (e) {
-            console.error("Extraction error:", e);
-            throw new Error("AI responded but no valid ComfyUI JSON could be extracted.");
+            console.error("JSON extraction error:", e);
+            throw new Error("The AI replied, but no valid ComfyUI JSON could be identified.");
         }
 
-        // Clean markdown remnants
+        // Clean markdown code blocks if the AI used them inside the tokens
         jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
 
-        // Final Parsing
+        // Final Parsing with cleanup
         let parsedData: any;
         try {
             parsedData = JSON.parse(jsonString);
         } catch (e: any) {
-            console.error("❌ JSON Syntax Error in string:", jsonString);
-            throw new Error(`Syntax Error in generated JSON: ${e.message}`);
+            console.error("❌ Parse failed on string:", jsonString);
+            throw new Error(`JSON Syntax Error: ${e.message}`);
         }
 
-        // Auto-Fix structure if wrapper is missing
+        // Auto-Repair common structural issues
         if (!parsedData.workflow && (parsedData.nodes || parsedData.links)) {
-            console.warn("⚠️ Repairing missing wrapper structure...");
+            console.warn("⚠️ Repairing missing 'workflow' wrapper...");
             parsedData = {
                 workflow: parsedData,
                 requirements: { models: [], custom_nodes: [] }
@@ -209,17 +213,17 @@ export const generateWorkflowLocal = async (
         }
 
         if (!parsedData.workflow) {
-             throw new Error("Workflow structure invalid (No 'workflow' key found).");
+             throw new Error("Invalid workflow structure received from AI.");
         }
 
         return {
-            thoughts: thoughts || "No reasoning logged.",
+            thoughts: thoughts || "No thoughts captured.",
             workflow: parsedData.workflow,
             requirements: parsedData.requirements
         };
 
     } catch (error: any) {
-        console.error("🔥 Fatal Error in Local Generation:", error);
+        console.error("🔥 Fatal Local Stream Error:", error);
         throw error;
     }
 };
@@ -266,8 +270,8 @@ export const validateAndCorrectWorkflowLocal = async (
             { role: "system", content: basePrompt },
             { role: "user", content: `Validate:\n\n${JSON.stringify(workflow)}` }
         ]);
-        const { json } = { json: JSON.parse(extractJson(content)) }; // Quick hack using extractJson
-        return json;
+        const jsonStr = extractJson(content);
+        return JSON.parse(jsonStr);
     } catch (e: any) { throw new Error(`Validation failed: ${e.message}`); }
 };
 
@@ -285,11 +289,12 @@ export const debugAndCorrectWorkflowLocal = async (
             { role: "system", content: basePrompt },
             { role: "user", content: JSON.stringify({ workflow, errorMessage }) }
         ]);
-        const { json } = { json: JSON.parse(extractJson(content)) };
-        return json;
+        const jsonStr = extractJson(content);
+        return JSON.parse(jsonStr);
     } catch (e: any) { throw new Error(`Debug failed: ${e.message}`); }
 };
 
+// --- RAG & Utility Exports ---
 export const uploadRagDocument = async (file: File, apiUrl: string) => { return { message: "ok" }; };
 export const queryRag = async (prompt: string, apiUrl: string, model?: string) => { return ""; };
 export const learnWorkflow = async (type: any, prompt: string, workflow: any, apiUrl: string) => { return { message: "ok" }; };
