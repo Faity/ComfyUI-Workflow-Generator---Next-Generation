@@ -9,74 +9,91 @@ import {
     API_FORMAT_INSTRUCTION 
 } from './prompts';
 
-// --- Helper to extract JSON from LLM text response ---
-const extractContentFromText = (text: string): { json: any, thoughts?: string } => {
-    let cleanText = text.trim();
-    let thoughts: string | undefined;
+/**
+ * Surgical JSON Extractor
+ * Prevents "Unexpected non-whitespace character" errors by intelligently 
+ * locating the actual ComfyUI JSON payload, ignoring braces in the thought process.
+ */
+function extractJsonFromText(text: string): { json: any, thoughts: string } {
+    let jsonString = "";
+    let thoughts = text;
 
-    // 1. Extract Thoughts if present (<thinking>...</thinking>) or custom THOUGHTS: format
-    const thinkingMatch = cleanText.match(/<thinking>([\s\S]*?)<\/thinking>/);
-    if (thinkingMatch && thinkingMatch[1]) {
-        thoughts = thinkingMatch[1].trim();
-        cleanText = cleanText.replace(thinkingMatch[0], '').trim();
-    }
-
-    // 2. Extract JSON
-    let jsonContent = cleanText;
-    
-    // Attempt 1: Regex for code blocks
-    const jsonBlockRegex = /```(?:json)?\s*([\s\S]*?)\s*```/i;
-    const match = cleanText.match(jsonBlockRegex);
-    
-    if (match && match[1]) {
-        jsonContent = match[1].trim();
+    // Strategy 1: Look for the explicit marker
+    const marker = "###JSON_START###";
+    const markerIdx = text.indexOf(marker);
+    if (markerIdx > -1) {
+        thoughts = text.substring(0, markerIdx).trim();
+        jsonString = text.substring(markerIdx + marker.length).trim();
     } else {
-        // Attempt 2: Robust Fallback with Balanced Brace Counting
-        const firstBrace = cleanText.indexOf('{');
-        if (firstBrace !== -1) {
-            let balance = 0;
-            let lastBrace = -1;
+        // Strategy 2: Look for typical ComfyUI JSON start patterns
+        const patterns = ['{"workflow"', '{"nodes"', '{"requirements"', '{"last_node_id"'];
+        let bestStartIndex = -1;
+
+        for (const pattern of patterns) {
+            const idx = text.indexOf(pattern);
+            if (idx > -1) {
+                if (bestStartIndex === -1 || idx < bestStartIndex) {
+                    bestStartIndex = idx;
+                }
+            }
+        }
+
+        if (bestStartIndex > -1) {
+            // Balanced brace counting to find the end of the object
+            let openBraces = 0;
+            let endIndex = -1;
             let insideString = false;
             let escape = false;
 
-            for (let i = firstBrace; i < cleanText.length; i++) {
-                const char = cleanText[i];
+            for (let i = bestStartIndex; i < text.length; i++) {
+                const char = text[i];
                 if (escape) { escape = false; continue; }
                 if (char === '\\') { escape = true; continue; }
                 if (char === '"') { insideString = !insideString; continue; }
 
                 if (!insideString) {
-                    if (char === '{') {
-                        balance++;
-                    } else if (char === '}') {
-                        balance--;
-                        if (balance === 0) {
-                            lastBrace = i;
+                    if (char === '{') openBraces++;
+                    else if (char === '}') {
+                        openBraces--;
+                        if (openBraces === 0) {
+                            endIndex = i;
                             break;
                         }
                     }
                 }
             }
 
-            if (lastBrace !== -1) {
-                jsonContent = cleanText.substring(firstBrace, lastBrace + 1);
-            } else {
-                const fallbackLastBrace = cleanText.lastIndexOf('}');
-                if (fallbackLastBrace !== -1) {
-                    jsonContent = cleanText.substring(firstBrace, fallbackLastBrace + 1);
-                }
+            if (endIndex > -1) {
+                jsonString = text.substring(bestStartIndex, endIndex + 1);
+                thoughts = text.substring(0, bestStartIndex).trim();
             }
         }
     }
 
-    try {
-        const parsedJson = JSON.parse(jsonContent);
-        return { json: parsedJson, thoughts };
-    } catch (e) {
-        console.error("JSON Parse Error. Raw Text:", text);
-        throw new Error(`Failed to parse JSON response: ${(e as Error).message}`);
+    // Fallback: Use the whole text if no structure was identified (unlikely to work but safe)
+    if (!jsonString) {
+        const firstBrace = text.indexOf('{');
+        const lastBrace = text.lastIndexOf('}');
+        if (firstBrace > -1 && lastBrace > firstBrace) {
+            jsonString = text.substring(firstBrace, lastBrace + 1);
+            thoughts = text.substring(0, firstBrace).trim();
+        } else {
+            jsonString = text;
+        }
     }
-};
+
+    // Clean up markdown markers if present
+    jsonString = jsonString.replace(/```json/g, '').replace(/```/g, '').trim();
+    thoughts = thoughts.replace('THOUGHTS:', '').replace(marker, '').trim();
+
+    try {
+        const parsed = JSON.parse(jsonString);
+        return { json: parsed, thoughts };
+    } catch (e) {
+        console.error("❌ Surgical Parser failed to parse JSON. Raw string:", jsonString);
+        throw new Error(`Syntax error in generated JSON: ${(e as Error).message}`);
+    }
+}
 
 // --- Main Local LLM Interaction Functions ---
 
@@ -111,8 +128,7 @@ async function callLocalLlmChat(apiUrl: string, model: string, messages: Array<{
 
 /**
  * STREAMING GENERATION - PANZER-LOGIK EDITION
- * Robust stream reading, splitting, fallback parsing, and auto-repair.
- * Now using the requested endpoint: /v1/generate_workflow_stream
+ * Robust stream reading, surgical parsing, and auto-repair.
  */
 export const generateWorkflowLocal = async (
     description: string,
@@ -159,7 +175,6 @@ export const generateWorkflowLocal = async (
 
     let endpoint: string;
     try {
-        // Updated to /v1/generate_workflow_stream as per user's "KORREKT" instruction
         endpoint = new URL('/v1/generate_workflow_stream', ragApiUrl).toString();
     } catch (e) {
         throw new Error(`Invalid Python Backend URL configured: ${ragApiUrl}`);
@@ -183,9 +198,7 @@ export const generateWorkflowLocal = async (
         const decoder = new TextDecoder();
         
         let fullText = '';
-        let thoughts = '';
         let isJsonMode = false;
-        let jsonBuffer = '';
         const MARKER = "###JSON_START###";
 
         // --- 3. STREAM LOOP ---
@@ -196,62 +209,28 @@ export const generateWorkflowLocal = async (
             const chunk = decoder.decode(value, { stream: true });
             fullText += chunk;
             
+            // Extract the "thoughts" part for real-time update
             if (!isJsonMode) {
                 if (fullText.includes(MARKER)) {
-                    // Split thought from JSON
-                    const parts = fullText.split(MARKER);
-                    thoughts = parts[0].trim().replace('THOUGHTS:', '').trim();
-                    jsonBuffer = parts[1] || ''; 
                     isJsonMode = true;
+                    const thoughts = fullText.split(MARKER)[0].replace('THOUGHTS:', '').trim();
                     onThoughtsUpdate(thoughts);
                 } else {
-                    const displayThoughts = fullText.replace('THOUGHTS:', '').trimStart();
-                    onThoughtsUpdate(displayThoughts);
+                    const thoughts = fullText.replace('THOUGHTS:', '').trimStart();
+                    onThoughtsUpdate(thoughts);
                 }
-            } else {
-                jsonBuffer += chunk;
             }
         }
 
-        console.log("🏁 Stream ended. Analyzing data...");
+        console.log("🏁 Stream ended. Performing surgical JSON extraction...");
 
-        // --- 4. FALLBACK LOGIK ---
-        let finalJsonString = jsonBuffer;
+        // --- 4. SURGICAL PARSING ---
+        let { json: parsedData, thoughts } = extractJsonFromText(fullText);
 
-        if (!isJsonMode) {
-            console.warn("⚠️ No marker '###JSON_START###' found! Attempting fallback parsing...");
-            const firstBrace = fullText.indexOf('{');
-            const lastBrace = fullText.lastIndexOf('}');
-            
-            if (firstBrace > -1 && lastBrace > firstBrace) {
-                thoughts = fullText.substring(0, firstBrace).replace('THOUGHTS:', '').trim();
-                finalJsonString = fullText.substring(firstBrace, lastBrace + 1);
-                console.log("✅ Fallback successful: JSON extracted.");
-            } else {
-                console.warn("⚠️ No braces found for fallback. Trying raw text...");
-                finalJsonString = fullText;
-                thoughts = "Parsing Error: Could not separate thoughts from JSON.";
-            }
-        }
-
-        finalJsonString = finalJsonString.replace(/```json/g, '').replace(/```/g, '').trim();
-
-        if (!finalJsonString) {
-             throw new Error("JSON buffer is empty! AI provided no output.");
-        }
-
-        // --- 5. PARSING ---
-        let parsedData: any;
-        try {
-            parsedData = JSON.parse(finalJsonString);
-        } catch (e) {
-            console.error("❌ JSON Parse Error. Raw string was:", finalJsonString);
-            throw new Error(`Syntax error in generated JSON: ${(e as Error).message}`);
-        }
-
-        // --- 6. AUTO-REPAIR ---
+        // --- 5. AUTO-REPAIR ---
+        // Ensure the data follows the { workflow: ..., requirements: ... } structure
         if (!parsedData.workflow && (parsedData.nodes || parsedData.links || Object.keys(parsedData).some(k => !isNaN(Number(k))))) {
-            console.warn("⚠️ Wrapper missing. Repairing structure...");
+            console.warn("⚠️ Payload structure missing wrapper. Auto-repairing...");
             parsedData = {
                 workflow: parsedData,
                 requirements: { models: [], custom_nodes: [] }
@@ -263,7 +242,7 @@ export const generateWorkflowLocal = async (
         }
 
         if (!parsedData.workflow) {
-             throw new Error("Invalid workflow structure (No 'workflow' object found).");
+             throw new Error("Surgical parser failed: No workflow object found in output.");
         }
 
         return {
@@ -273,33 +252,21 @@ export const generateWorkflowLocal = async (
         };
 
     } catch (error: any) {
-        console.error("🔥 FATAL ERROR in Stream Service:", error);
+        console.error("🔥 FATAL ERROR in Local LLM Stream Service:", error);
         if (error instanceof TypeError && error.message === 'Failed to fetch') {
-            throw new Error(`Connection Failed to Backend (${endpoint}). Is the Python server running and CORS enabled?`);
+            throw new Error(`Connection Failed to Backend (${endpoint}). Check server and CORS settings.`);
         }
         throw error;
     }
 };
 
 /**
- * OLD: Non-streaming generation function.
- * @deprecated Use generateWorkflowLocal instead.
- */
-export const generateWorkflowLocalOld = async (
-    prompt: string,
-    backendApiUrl: string
-): Promise<GeneratedWorkflowResponse> => {
-    // This was previously generateWorkflowLocal. We've moved back to streaming.
-    throw new Error("Deprecated. Use streaming version.");
-};
-
-/**
- * STREAMING GENERATION - Kept as internal reference.
- * @deprecated Merged into generateWorkflowLocal
+ * STREAMING GENERATION - Alias for standard entry point
  */
 export const generateWorkflowStream = generateWorkflowLocal;
 
-// ... (Rest of existing functions unchanged)
+// --- Remaining Utility Functions ---
+
 export const validateAndCorrectWorkflowLocal = async (
     workflow: ComfyUIWorkflow | ComfyUIApiWorkflow, 
     localLlmApiUrl: string, 
@@ -315,7 +282,7 @@ export const validateAndCorrectWorkflowLocal = async (
             { role: "system", content: basePrompt },
             { role: "user", content: `Validate:\n\n${workflowString}` }
         ]);
-        const { json } = extractContentFromText(content);
+        const { json } = extractJsonFromText(content);
         return json;
     } catch (e: any) { throw new Error(`Validation failed: ${e.message}`); }
 };
@@ -336,7 +303,7 @@ export const debugAndCorrectWorkflowLocal = async (
             { role: "system", content: basePrompt },
             { role: "user", content: payload }
         ]);
-        const { json } = extractContentFromText(content);
+        const { json } = extractJsonFromText(content);
         return json;
     } catch (e: any) { throw new Error(`Debug failed: ${e.message}`); }
 };
