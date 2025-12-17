@@ -160,11 +160,13 @@ const App: React.FC = () => {
 
   const handleGenerate = async () => {
     if (!ensureApiKey() || !prompt.trim()) return;
+    
+    // Reset state for new generation
     setGeneratedData(null);
     setGeneratedImages([]);
     setSelectedHistoryId(null);
     setLastRunSuccess(false);
-    setLiveThoughts('');
+    setLiveThoughts(''); // Important: Clear thoughts only at the start
     setWorkflowFormat('api');
     
     let finalData: GeneratedWorkflowResponse | null = null;
@@ -195,7 +197,6 @@ const App: React.FC = () => {
           if (!ragApiUrl) {
               throw new Error("Python Backend URL is missing. Please check settings.");
           }
-          // Now using restored streaming logic for local LLM
           response = await generateWorkflowLocal(
               prompt, 
               localLlmApiUrl, 
@@ -266,7 +267,8 @@ const App: React.FC = () => {
       showToast(error.message || t.toastUnknownError, 'error');
     } finally {
       setLoadingState({ active: false, message: '', progress: 0 });
-      setLiveThoughts(''); // Clear thoughts after generation
+      // CRITICAL CHANGE: We no longer clear liveThoughts here.
+      // This allows the user to read the AI's reasoning even if a crash occurred.
     }
   };
   
